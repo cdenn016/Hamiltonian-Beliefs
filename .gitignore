@@ -21,4 +21,5 @@ env/
 
 # Output directories
 phase_space_output/
+orbit_analysis/
 *.pkl
