@@ -841,6 +841,16 @@ class HamiltonianTrainer:
 
         except KeyboardInterrupt:
             print("\n⚠ Training interrupted by user")
+        except Exception as e:
+            print(f"\n⚠ Training stopped due to error: {e}")
+            print("  Generating phase space report with data collected so far...")
+            # Generate report even on crash
+            if self.phase_space_tracker is not None and len(self.phase_space_tracker.snapshots) > 0:
+                self.phase_space_tracker.generate_orbit_report(
+                    output_dir=self.phase_space_output_dir,
+                    max_agents=min(4, len(self.system.agents))
+                )
+            raise  # Re-raise the exception after saving plots
 
         # Final summary
         final_energies = compute_total_free_energy(self.system)
