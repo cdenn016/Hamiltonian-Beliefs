@@ -432,11 +432,7 @@ def _run_hamiltonian_training(system, cfg, output_dir):
     - Phase portrait visualization
     """
     from pathlib import Path
-    import numpy as np
-    
-    # Import the new tracker
-    from geometry.phase_space_tracker import PhaseSpaceTracker
-    
+
     print(f"\n{'='*70}")
     print("HAMILTONIAN DYNAMICS WITH ORBIT TRACKING")
     print(f"{'='*70}")
@@ -462,117 +458,36 @@ def _run_hamiltonian_training(system, cfg, output_dir):
         checkpoint_dir=str(output_dir / "checkpoints"),
     )
     
-    # Initialize Hamiltonian trainer
+    # Initialize Hamiltonian trainer with built-in phase space tracking
     from agent.hamiltonian_trainer import HamiltonianTrainer
+    orbit_dir = output_dir / "orbit_analysis"
     trainer = HamiltonianTrainer(
         system,
         config=training_cfg,
         friction=cfg.hamiltonian_friction,
-        mass_scale=cfg.hamiltonian_mass_scale
+        mass_scale=cfg.hamiltonian_mass_scale,
+        track_phase_space=True,
+        phase_space_output_dir=orbit_dir
     )
-    
-    # Initialize phase space tracker
-    phase_tracker = PhaseSpaceTracker(
-        track_interval=getattr(cfg, 'phase_space_track_interval', 1),
-        track_sigma_eigenvalues=getattr(cfg, 'phase_space_track_sigma', True),
-        track_gauge=getattr(cfg, 'phase_space_track_gauge', False),
-        recurrence_threshold=0.1,
-    )
-    
-    # We need to track momenta manually since HamiltonianTrainer manages them internally
-    # Extract initial momenta
-    agent_momenta = {}
-    for agent in system.agents:
-        agent_momenta[agent.agent_id] = {
-            'mu': np.zeros(agent.mu_q.size)
-        }
-    
-    # Record initial state
-    dt = cfg.hamiltonian_dt
-    t = 0.0
-    
-    # Initial energy
-    from gradients.free_energy_clean import compute_total_free_energy
-    energies = compute_total_free_energy(system)
-    
-    # Compute initial kinetic energy
-    T_initial = 0.0
-    for agent in system.agents:
-        p = agent_momenta[agent.agent_id]['mu']
-        # T = (1/2) p^T M^{-1} p, where M = mass_scale * I
-        T_initial += 0.5 * np.dot(p, p) / cfg.hamiltonian_mass_scale
-    
-    phase_tracker.record(
-        step=0,
-        t=0.0,
-        agents=system.agents,
-        momenta=agent_momenta,
-        energies=(T_initial, energies.total, T_initial + energies.total)
-    )
-    
+
+    # Configure tracker with user settings if available
+    if trainer.phase_space_tracker is not None:
+        trainer.phase_space_tracker.track_interval = getattr(cfg, 'phase_space_track_interval', 1)
+        trainer.phase_space_tracker.recurrence_threshold = 0.1
+
     print(f"\n  Training loop starting...")
-    print(f"  Initial energy: {energies.total:.4f}")
-    
-    # Manual training loop with phase space recording
-    for step in range(cfg.n_steps):
-        # Perform Hamiltonian step
-        # The trainer internally manages momenta, so we need to extract them
-        
-        # Step the trainer
-        energies = trainer.step(dt=dt)
-        t += dt
-        
-        # Extract current momenta from trainer's internal state
-        # Note: This requires access to trainer's internal momentum variable
-        # We'll use the velocity * mass approximation
-        if hasattr(trainer, 'p'):
-            # Direct access if available
-            current_p = trainer.p.copy()
-        else:
-            # Approximate from velocity (trainer.history tracks velocity_norm)
-            # For now, we'll track based on what's available
-            current_p = np.zeros(trainer.theta.shape)
-        
-        # Update our momentum tracking
-        idx = 0
-        for agent in system.agents:
-            size = agent.mu_q.size
-            agent_momenta[agent.agent_id]['mu'] = current_p[idx:idx+size] if len(current_p) > idx else np.zeros(size)
-            idx += size
-        
-        # Compute Hamiltonian energies
-        T = 0.0
-        for agent in system.agents:
-            p = agent_momenta[agent.agent_id]['mu']
-            T += 0.5 * np.dot(p, p) / cfg.hamiltonian_mass_scale
-        V = energies.total
-        H = T + V
-        
-        # Record to phase tracker
-        phase_tracker.record(
-            step=step + 1,
-            t=t,
-            agents=system.agents,
-            momenta=agent_momenta,
-            energies=(T, V, H)
-        )
-        
-        # Logging
-        if (step + 1) % cfg.log_every == 0:
-            print(f"  Step {step+1:5d} | t={t:.3f} | V={V:.4f} | T={T:.4f} | H={H:.4f}")
-    
-    # Get trainer history
-    history = trainer.history
-    
-    # Save everything
+
+    # Use trainer's train() method - it handles phase space recording automatically
+    dt = cfg.hamiltonian_dt
+    history = trainer.train(n_steps=cfg.n_steps, dt=dt)
+
+    # Save history and plots
     _save_history(history, output_dir)
     _plot_hamiltonian_energy(history, output_dir)
-    
-    # Generate orbit analysis
-    orbit_dir = output_dir / "orbit_analysis"
-    phase_tracker.generate_orbit_report(orbit_dir)
-    phase_tracker.save(output_dir / "phase_space_tracker.pkl")
-    
+
+    # Save phase space tracker for later analysis
+    trainer.save_phase_space_tracker(output_dir / "phase_space_tracker.pkl")
+
     return history
 
 
