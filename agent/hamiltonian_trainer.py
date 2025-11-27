@@ -43,6 +43,7 @@ import time
 from gradients.free_energy_clean import compute_total_free_energy, FreeEnergyBreakdown
 from config import TrainingConfig
 from data_utils.mu_tracking import create_mu_tracker, MuCenterTracking
+from geometry.phase_space_tracker import PhaseSpaceTracker
 
 
 @dataclass
@@ -189,7 +190,9 @@ class HamiltonianTrainer:
 
     def __init__(self, system, config: Optional[TrainingConfig] = None,
                  friction: float = 0.0,
-                 mass_scale: float = 1.0):
+                 mass_scale: float = 1.0,
+                 track_phase_space: bool = True,
+                 phase_space_output_dir: Optional[Path] = None):
         """
         Initialize Hamiltonian trainer.
 
@@ -202,6 +205,8 @@ class HamiltonianTrainer:
                      1.0: Critical damping
                      10.0: Heavy damping (approaches overdamped)
             mass_scale: Overall mass scale (affects oscillation frequency)
+            track_phase_space: Whether to enable PhaseSpaceTracker for orbit visualization
+            phase_space_output_dir: Directory for phase space plots (default: ./phase_space_output)
         """
         self.system = system
         self.config = config or TrainingConfig()
@@ -211,9 +216,23 @@ class HamiltonianTrainer:
         # Training state
         self.history = HamiltonianHistory()
         self.current_step = 0
+        self.continuous_time = 0.0  # Track continuous time for phase space
 
         # Mu tracking
         self.history.mu_tracker = create_mu_tracker(system)
+
+        # Phase space tracking for orbit visualization
+        self.track_phase_space = track_phase_space
+        self.phase_space_output_dir = phase_space_output_dir or Path("./phase_space_output")
+        if track_phase_space:
+            self.phase_space_tracker = PhaseSpaceTracker(
+                track_interval=1,
+                max_snapshots=10000,
+                track_sigma_eigenvalues=True,
+                track_gauge=False,
+            )
+        else:
+            self.phase_space_tracker = None
 
         # Initialize phase space coordinates
         self._initialize_phase_space()
@@ -225,6 +244,8 @@ class HamiltonianTrainer:
         print(f"  Friction: γ = {friction}")
         print(f"  Mass scale: {mass_scale}")
         print(f"  Regime: {'Conservative' if friction < 0.01 else 'Damped'}")
+        if track_phase_space:
+            print(f"  Phase space tracking: ENABLED")
 
     def _initialize_phase_space(self):
         """
@@ -724,10 +745,48 @@ class HamiltonianTrainer:
                 system=self.system
             )
 
+        # Record phase space for orbit visualization
+        if self.phase_space_tracker is not None:
+            momenta = self._build_momenta_dict()
+            self.phase_space_tracker.record(
+                step=self.current_step,
+                t=self.continuous_time,
+                agents=self.system.agents,
+                momenta=momenta,
+                energies=(T, V, H),
+            )
+
         self.current_step += 1
+        self.continuous_time += dt
         self._step_times.append(time.perf_counter() - step_start)
 
         return energies
+
+    def _build_momenta_dict(self) -> dict:
+        """
+        Build momenta dictionary from flat momentum vector for PhaseSpaceTracker.
+
+        Returns:
+            Dict mapping agent_id -> {'mu': π_μ array}
+        """
+        momenta = {}
+        idx = 0
+
+        for agent in self.system.agents:
+            K = agent.config.K
+            n_spatial = agent.mu_q.size // K
+            mu_size = n_spatial * K
+            Sigma_size_per_point = K * (K + 1) // 2
+
+            # Extract mu momentum
+            pi_mu = self.p[idx:idx + mu_size].reshape(agent.mu_q.shape)
+            momenta[agent.agent_id] = {'mu': pi_mu}
+
+            idx += mu_size
+            # Skip Sigma momenta (not currently tracked in PhaseSpaceTracker)
+            idx += n_spatial * Sigma_size_per_point
+
+        return momenta
 
     def train(self, n_steps: Optional[int] = None, dt: float = 0.01) -> HamiltonianHistory:
         """
@@ -811,6 +870,14 @@ class HamiltonianTrainer:
         print(f"  Steps/second: {1.0/avg_step_time:.2f}")
         print("="*70)
 
+        # Generate phase space orbit report
+        if self.phase_space_tracker is not None and len(self.phase_space_tracker.snapshots) > 0:
+            print("\nGenerating phase space orbit analysis...")
+            self.phase_space_tracker.generate_orbit_report(
+                output_dir=self.phase_space_output_dir,
+                max_agents=min(4, len(self.system.agents))
+            )
+
         return self.history
 
     def _log_step(self, step: int, energies: FreeEnergyBreakdown):
@@ -830,3 +897,45 @@ class HamiltonianTrainer:
                 msg += f"  ({recent_time:.3f}s)"
 
             print(msg)
+
+    def generate_phase_space_report(self, output_dir: Optional[Path] = None, max_agents: int = 4):
+        """
+        Manually generate phase space orbit analysis report.
+
+        Call this if you want to generate the report at a specific point
+        during training or after loading a saved tracker.
+
+        Args:
+            output_dir: Directory for output plots (defaults to phase_space_output_dir)
+            max_agents: Maximum number of agents to analyze
+        """
+        if self.phase_space_tracker is None:
+            print("Phase space tracking not enabled")
+            return
+
+        if len(self.phase_space_tracker.snapshots) == 0:
+            print("No phase space data recorded yet")
+            return
+
+        output_dir = output_dir or self.phase_space_output_dir
+        self.phase_space_tracker.generate_orbit_report(
+            output_dir=output_dir,
+            max_agents=max_agents
+        )
+
+    def save_phase_space_tracker(self, path: Optional[Path] = None):
+        """
+        Save phase space tracker state for later analysis.
+
+        Args:
+            path: File path (defaults to phase_space_output_dir/tracker.pkl)
+        """
+        if self.phase_space_tracker is None:
+            print("Phase space tracking not enabled")
+            return
+
+        if path is None:
+            self.phase_space_output_dir.mkdir(parents=True, exist_ok=True)
+            path = self.phase_space_output_dir / "tracker.pkl"
+
+        self.phase_space_tracker.save(path)
