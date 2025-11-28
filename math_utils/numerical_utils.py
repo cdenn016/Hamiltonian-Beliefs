@@ -405,19 +405,32 @@ def TUFF_sanitize_sigma(
 # -----------------------------------------------------------------------------
 # Sigma sanitation (vectorized)
 # -----------------------------------------------------------------------------
-def sanitize_sigma(Sigma: np.ndarray, 
+def sanitize_sigma(Sigma: np.ndarray,
                    eps: float = 1e-4,  # INCREASE from 1e-6!
                    max_cond: float = 1e4,  # DECREASE from 1e6!
                    max_eig: float = None) -> np.ndarray:
     """
     Sanitize covariance matrix for numerical stability.
     """
+    # Check for NaN/Inf and replace with identity if needed
+    if not np.isfinite(Sigma).all():
+        K = Sigma.shape[-1]
+        spatial_shape = Sigma.shape[:-2]
+        # Replace with identity scaled by eps
+        Sigma = np.broadcast_to(eps * np.eye(K), (*spatial_shape, K, K)).copy()
+
     # Symmetrize
     Sigma = 0.5 * (Sigma + np.swapaxes(Sigma, -1, -2))
-    
-    # Eigendecomposition
-    w, V = np.linalg.eigh(Sigma)
-    
+
+    # Try eigendecomposition with fallback
+    try:
+        w, V = np.linalg.eigh(Sigma)
+    except np.linalg.LinAlgError:
+        # Fallback: return identity scaled by eps
+        K = Sigma.shape[-1]
+        spatial_shape = Sigma.shape[:-2]
+        return np.broadcast_to(eps * np.eye(K), (*spatial_shape, K, K)).copy().astype(Sigma.dtype)
+
     # CRITICAL: Absolute floor (not relative!)
     MIN_EIGENVALUE = 1e-4  # Prevents confidence explosion
     w = np.maximum(w, MIN_EIGENVALUE)

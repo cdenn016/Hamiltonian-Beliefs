@@ -79,7 +79,7 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
         agent_cfg = AgentConfig(
             spatial_shape=(config.spatial_size,),
             K=config.K,
-            phi_scale=0.5,  # Stronger initial gauge field to see dynamics
+            phi_scale=0.2,  # Moderate initial gauge field
         )
 
         # Create agent with correct constructor signature
