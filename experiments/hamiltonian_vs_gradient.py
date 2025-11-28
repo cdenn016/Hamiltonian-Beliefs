@@ -115,8 +115,8 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
 
         agents.append(agent)
 
-    from simulation_config import SimulationConfig
-    sys_config = SimulationConfig(n_agents=config.n_agents, K=config.K)
+    from config import SystemConfig
+    sys_config = SystemConfig()  # Use defaults
     system = MultiAgentSystem(agents, config=sys_config)
     return system
 
