@@ -105,7 +105,7 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
 
     Uses overlapping support regions to create interesting dynamics.
     """
-    from agent.masking import SupportConfig, SupportRegionSmooth
+    from agent.masking import MaskConfig, SupportRegionSmooth
     from math_utils.sigma import CovarianceFieldInitializer
 
     # Create 1D base manifold
@@ -121,9 +121,7 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
         # Agent i is centered at position i * spatial_size / n_agents
         center = int((i + 0.5) * config.spatial_size / config.n_agents)
 
-        support_cfg = SupportConfig(
-            n_spatial=config.spatial_size,
-            soft_boundary_width=5.0,
+        mask_cfg = MaskConfig(
             min_mask_for_normal_cov=0.1,
         )
 
@@ -134,12 +132,14 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
             config.spatial_size - np.abs(x - center)  # Periodic
         )
         width = config.spatial_size / (2 * config.n_agents)
-        mask = np.exp(-0.5 * (distances / width) ** 2)
+        mask_continuous = np.exp(-0.5 * (distances / width) ** 2).astype(np.float32)
+        mask_binary = mask_continuous > 0.1  # Threshold for binary mask
 
         support = SupportRegionSmooth(
-            mask_continuous=mask.astype(np.float32),
+            mask_binary=mask_binary,
             base_shape=(config.spatial_size,),
-            config=support_cfg
+            config=mask_cfg,
+            mask_continuous=mask_continuous,
         )
 
         # Agent config
