@@ -37,7 +37,7 @@ class ExperimentConfig:
     spatial_size: int = 50
     n_steps: int = 500
     dt: float = 0.01
-    friction_values: List[float] = field(default_factory=lambda: [0.0, 0.1, 0.5, 1.0, 2.0])
+    friction_values: List[float] = field(default_factory=lambda: [0.05, 0.1, 0.5, 1.0])  # No γ=0: unstable on hyperbolic SPD
     mass_scale: float = 1.0
     lr_mu: float = 0.01
     lr_sigma: float = 0.001
