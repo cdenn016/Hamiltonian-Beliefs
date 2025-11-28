@@ -85,7 +85,7 @@ def main():
     print(summary)
 
     summary_path = config.output_dir / "summary.md"
-    with open(summary_path, 'w') as f:
+    with open(summary_path, 'w', encoding='utf-8') as f:
         f.write("# Hamiltonian vs Gradient VFE Comparison\n\n")
         f.write(summary)
     print(f"\n✓ Summary saved: {summary_path}")
