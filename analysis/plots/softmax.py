@@ -21,20 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-
-def _get_spatial_shape_from_system(system):
-    """Infer spatial shape from first agent's support or base_manifold."""
-    a0 = system.agents[0]
-    if hasattr(a0, "support") and a0.support is not None:
-        shape = getattr(a0.support, "base_shape", None)
-        if shape is None:
-            shape = getattr(a0.support, "mask", np.array([])).shape
-        return tuple(shape)
-    if hasattr(a0, "base_manifold"):
-        return tuple(a0.base_manifold.shape)
-    if hasattr(a0, "support_shape"):
-        return tuple(a0.support_shape)
-    return ()
+from analysis.plots import get_spatial_shape_from_system
 
 
 def _pick_reference_agent(system):
@@ -70,7 +57,7 @@ def plot_softmax_weights(system, out_dir: Path, agent_idx: int = None, mode: str
     if agent_idx is None:
         agent_idx = _pick_reference_agent(system)
 
-    shape = _get_spatial_shape_from_system(system)
+    shape = get_spatial_shape_from_system(system)
     ndim = len(shape)
 
     neighbors = system.get_neighbors(agent_idx)
