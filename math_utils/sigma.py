@@ -300,57 +300,6 @@ def generate_random_spd(
     return Sigma.astype(np.float32)
 
 
-def generate_lowrank_plus_diagonal(
-    K: int,
-    rank: int,
-    *,
-    factor_scale: float = 1.0,
-    diagonal_scale: float = 0.1,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """
-    Generate Σ = U Uᵀ + D where U ∈ ℝᴷˣʳ, D diagonal.
-    
-    This is a common structured covariance (factor model).
-    
-    Args:
-        K: Dimension
-        rank: Rank of low-rank component
-        factor_scale: Scale of U
-        diagonal_scale: Scale of diagonal D
-        rng: Random generator
-    
-    Returns:
-        Sigma: (K, K) positive-definite matrix
-    
-    Properties:
-        - Effective rank ≈ rank (if diagonal_scale << factor_scale)
-        - Computationally efficient for inference
-        - Interpretable (U captures correlations, D captures noise)
-    
-    Examples:
-        >>> # Factor model with rank=2 in K=5 dimensions
-        >>> Sigma = generate_lowrank_plus_diagonal(5, rank=2)
-        >>> print(f"Eigenvalues: {np.linalg.eigvalsh(Sigma)}")
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    
-    if rank > K:
-        raise ValueError(f"Rank {rank} cannot exceed dimension {K}")
-    
-    # Low-rank component: U ∈ ℝᴷˣʳ
-    U = factor_scale * rng.standard_normal((K, rank))
-    
-    # Diagonal component
-    D = diagonal_scale * rng.uniform(0.5, 2.0, size=K)
-    
-    # Σ = UUᵀ + diag(D)
-    Sigma = U @ U.T + np.diag(D)
-    
-    return Sigma.astype(np.float32)
-
-
 def cholesky_to_covariance(L: np.ndarray) -> np.ndarray:
     """
     Convert Cholesky factor L to covariance Σ = L Lᵀ.
@@ -477,70 +426,6 @@ def generate_random_spd_field(
     return Sigma_field
 
 
-def qgenerate_smooth_spd_field(
-    spatial_shape: Tuple[int, ...],
-    K: int,
-    *,
-    smoothness_scale: float = 5.0,
-    min_eigenvalue: float = 0.1,
-    max_eigenvalue: float = 10.0,
-    scale: float = 1.0,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """
-    Generate spatially SMOOTH covariance field (FIXED VERSION).
-    
-    Key fix: Rescale BEFORE smoothing, not after!
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    
-    # Step 1: Generate random SPD field with TARGET scale already
-    Sigma_random = generate_random_spd_field(
-        spatial_shape, K,
-        min_eigenvalue=min_eigenvalue * scale,  # ← Scale min
-        max_eigenvalue=max_eigenvalue * scale,   # ← Scale max
-        scale=scale,  # This is already applied in generate_random_spd
-        rng=rng
-    )
-    
-    # Step 2: Convert to Cholesky factors
-    L_field = covariance_to_cholesky(Sigma_random)
-    
-    # Step 3: Smooth each component of L independently
-    L_smooth = np.zeros_like(L_field)
-    
-    for i in range(K):
-        for j in range(K):
-            # Smooth L[..., i, j] spatially
-            L_smooth[..., i, j] = gaussian_filter(
-                L_field[..., i, j],
-                sigma=smoothness_scale,
-                mode='wrap'
-            )
-    
-    # Step 4: Ensure lower-triangular with positive diagonal
-    for i in range(K):
-        # Zero out upper triangle
-        for j in range(i+1, K):
-            L_smooth[..., i, j] = 0
-        
-        # Ensure positive diagonal (absolute value + floor)
-        L_smooth[..., i, i] = np.abs(L_smooth[..., i, i]) + min_eigenvalue * scale
-    
-    # Step 5: Reconstruct Σ = L L^T
-    Sigma_smooth = cholesky_to_covariance(L_smooth)
-    
-    # NO STEP 6! Don't renormalize after smoothing!
-    # The smoothing already preserves approximate scale.
-    
-    return Sigma_smooth
-
-
-# ============================================================================
-# Alternative: Pre-scale normalization (gentler approach)
-# ============================================================================
-
 def generate_smooth_spd_field(
     spatial_shape: Tuple[int, ...],
     K: int,
@@ -610,66 +495,6 @@ def generate_smooth_spd_field(
     
     return Sigma_smooth
 
-
-# ============================================================================
-# RECOMMENDED: Simplest fix - just remove Step 6
-# ============================================================================
-
-def generate_smooth_spd_field_SIMPLE_FIX(
-    spatial_shape: Tuple[int, ...],
-    K: int,
-    *,
-    smoothness_scale: float = 5.0,
-    min_eigenvalue: float = 0.1,
-    max_eigenvalue: float = 10.0,
-    scale: float = 1.0,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """
-    Smooth SPD field - SIMPLEST FIX.
-    
-    Just REMOVE the pointwise renormalization (Step 6).
-    Let the smoothing preserve the scale naturally.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    
-    # Step 1: Generate with proper scaling from the start
-    Sigma_random = generate_random_spd_field(
-        spatial_shape, K,
-        min_eigenvalue=min_eigenvalue,
-        max_eigenvalue=max_eigenvalue,
-        scale=scale,
-        rng=rng
-    )
-    
-    # Step 2: Cholesky
-    L_field = covariance_to_cholesky(Sigma_random)
-    
-    # Step 3: Smooth
-    L_smooth = np.zeros_like(L_field)
-    for i in range(K):
-        for j in range(K):
-            L_smooth[..., i, j] = gaussian_filter(
-                L_field[..., i, j],
-                sigma=smoothness_scale,
-                mode='wrap'
-            )
-    
-    # Step 4: Fix triangular structure
-    for i in range(K):
-        for j in range(i+1, K):
-            L_smooth[..., i, j] = 0
-        L_smooth[..., i, i] = np.abs(L_smooth[..., i, i]) + min_eigenvalue
-    
-    # Step 5: Reconstruct
-    Sigma_smooth = cholesky_to_covariance(L_smooth)
-    
-    # THAT'S IT! No Step 6!
-    
-    return Sigma_smooth
-
-    
 
 def generate_structured_field(
     spatial_shape: Tuple[int, ...],
