@@ -76,10 +76,12 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
     agents = []
     for i in range(config.n_agents):
         # Create agent config with correct parameters
+        # Reduce phi_scale for larger K to avoid numerical issues in transport
+        phi_s = 0.1 if config.K <= 3 else 0.05
         agent_cfg = AgentConfig(
             spatial_shape=(config.spatial_size,),
             K=config.K,
-            phi_scale=0.2,  # Moderate initial gauge field
+            phi_scale=phi_s,
         )
 
         # Create agent with correct constructor signature
@@ -188,9 +190,12 @@ def run_hamiltonian_experiment(system: MultiAgentSystem, config: ExperimentConfi
     result.energy_trajectory.append(initial_H)
     result.time_trajectory.append(0.0)
 
+    # Reduce dt for larger K to maintain numerical stability
+    effective_dt = config.dt if config.K <= 3 else config.dt / 2
+
     start_time = time.perf_counter()
     for step in range(config.n_steps):
-        trainer.step(dt=config.dt)
+        trainer.step(dt=effective_dt)
         if trainer.history.total_hamiltonian:
             result.energy_trajectory.append(trainer.history.total_hamiltonian[-1])
         result.time_trajectory.append(time.perf_counter() - start_time)
