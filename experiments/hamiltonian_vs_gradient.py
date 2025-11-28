@@ -37,7 +37,7 @@ class ExperimentConfig:
     spatial_size: int = 50
     n_steps: int = 500
     dt: float = 0.01
-    friction_values: List[float] = field(default_factory=lambda: [0.0, 0.01, 0.1, 0.5])
+    friction_values: List[float] = field(default_factory=lambda: [0.0, 0.1, 0.5, 1.0, 2.0])
     mass_scale: float = 1.0
     lr_mu: float = 0.01
     lr_sigma: float = 0.001
@@ -79,6 +79,7 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
         agent_cfg = AgentConfig(
             spatial_shape=(config.spatial_size,),
             K=config.K,
+            phi_scale=0.5,  # Stronger initial gauge field to see dynamics
         )
 
         # Create agent with correct constructor signature
@@ -122,6 +123,11 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
         lambda_prior_align=0.5,   # Prior alignment
     )
     system = MultiAgentSystem(agents, config=sys_config)
+
+    # Debug: Show initial phi stats
+    phi_values = [np.linalg.norm(a.gauge.phi) for a in agents]
+    print(f"  Initial φ norms: {[f'{v:.3f}' for v in phi_values]}")
+
     return system
 
 
