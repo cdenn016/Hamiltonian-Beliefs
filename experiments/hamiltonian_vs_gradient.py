@@ -116,7 +116,11 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
         agents.append(agent)
 
     from config import SystemConfig
-    sys_config = SystemConfig()  # Use defaults
+    sys_config = SystemConfig(
+        lambda_phi=1.0,           # Enable gauge field dynamics
+        lambda_belief_align=1.0,  # Inter-agent belief coupling
+        lambda_prior_align=0.5,   # Prior alignment
+    )
     system = MultiAgentSystem(agents, config=sys_config)
     return system
 
