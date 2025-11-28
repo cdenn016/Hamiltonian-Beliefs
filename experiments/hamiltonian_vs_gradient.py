@@ -75,8 +75,25 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
 
     agents = []
     for i in range(config.n_agents):
-        center = int((i + 0.5) * config.spatial_size / config.n_agents)
+        # Create agent config with correct parameters
+        agent_cfg = AgentConfig(
+            spatial_shape=(config.spatial_size,),
+            K=config.K,
+        )
 
+        # Create agent with correct constructor signature
+        agent = Agent(
+            agent_id=i,
+            config=agent_cfg,
+            rng=rng,
+            base_manifold=manifold,
+        )
+
+        # Override mu_q with random initial values for interesting dynamics
+        agent.mu_q = 0.5 * rng.standard_normal((config.spatial_size, config.K)).astype(np.float32)
+
+        # Create custom overlapping support
+        center = int((i + 0.5) * config.spatial_size / config.n_agents)
         mask_cfg = MaskConfig(min_mask_for_normal_cov=0.1)
 
         x = np.arange(config.spatial_size)
@@ -94,29 +111,8 @@ def create_test_system(config: ExperimentConfig, rng: np.random.Generator) -> Mu
             config=mask_cfg,
             mask_continuous=mask_continuous,
         )
+        agent.support = support
 
-        agent_cfg = AgentConfig(
-            K=config.K,
-            agent_id=f"agent_{i}",
-            n_spatial=config.spatial_size,
-        )
-
-        mu_q = 0.5 * rng.standard_normal((config.spatial_size, config.K)).astype(np.float32)
-        mu_p = np.zeros((config.spatial_size, config.K), dtype=np.float32)
-
-        cov_init = CovarianceFieldInitializer(strategy="constant")
-        Sigma_q = cov_init.generate((config.spatial_size,), config.K, scale=1.0, rng=rng)
-        Sigma_p = cov_init.generate((config.spatial_size,), config.K, scale=2.0, rng=rng)
-
-        agent = Agent(
-            config=agent_cfg,
-            base_manifold=manifold,
-            support=support,
-            mu_q=mu_q,
-            Sigma_q=Sigma_q,
-            mu_p=mu_p,
-            Sigma_p=Sigma_p,
-        )
         agents.append(agent)
 
     from simulation_config import SimulationConfig
