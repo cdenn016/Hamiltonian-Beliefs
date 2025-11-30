@@ -370,7 +370,7 @@ def _compute_parameter_index_ranges(trainer) -> Dict[int, Tuple[int, int, int, i
 
 
 # =============================================================================
-# Analytical Geodesic Forces (Future Enhancement)
+# Analytical Geodesic Forces
 # =============================================================================
 
 def compute_geodesic_force_analytical(
@@ -379,25 +379,322 @@ def compute_geodesic_force_analytical(
     p: np.ndarray
 ) -> np.ndarray:
     """
-    Analytical computation of geodesic force (PLACEHOLDER).
+    Analytical computation of geodesic force.
 
-    This would compute dM^{-1}/d\theta analytically using:
+    Computes -(1/2) π^T (dM^{-1}/dθ) π analytically using:
 
-    1. d(A^{-1})/dx = -A^{-1} (dA/dx) A^{-1}
+    1. d(M^{-1})/dμ_k = -M^{-1} (dM/dμ_k) M^{-1}
 
-    2. dM/d\mu_k = sum_j (d\beta_ij/d\mu_k) Omega_ij Sigma_qj^{-1} Omega_ij^T
+    2. dM/dμ_k = Σ_j (dβ_ij/dμ_k) Ω_ij Σ_qj^{-1} Ω_ij^T
 
-    3. d\beta_ij/d\mu_k = -(\beta_ij/kappa) * [d KL_ij/d\mu_k - sum_m \beta_im d KL_im/d\mu_k]
+    3. dβ_ij/dμ_k = Σ_m (dβ_ij/dKL_im) · (dKL_im/dμ_k)
 
-    This is more efficient than finite differences but requires careful
-    implementation of the chain rule through softmax.
+    where:
+    - dβ_ij/dKL_ij = -(β_ij/κ)(1 - β_ij)     [diagonal]
+    - dβ_ij/dKL_im = +(β_ij β_im)/κ          [off-diagonal, m≠j]
+    - dKL_im/dμ_i = Σ_jt^{-1}(μ_i - μ_m^t)   [gradient of KL w.r.t. source mean]
 
-    TODO: Implement analytical gradients for better performance.
+    Args:
+        trainer: HamiltonianTrainer with system reference
+        theta: Current parameter vector
+        p: Current momentum vector
+
+    Returns:
+        geodesic_force: Force vector with same shape as theta
+
+    Performance:
+        O(n_agents² × n_neighbors × K³) vs O(n_params × n_agents × K³) for finite diff.
+        More efficient when n_params >> n_agents × n_neighbors.
     """
-    raise NotImplementedError(
-        "Analytical geodesic forces not yet implemented. "
-        "Use compute_geodesic_force with finite differences."
-    )
+    from gradients.softmax_grads import compute_softmax_weights, compute_softmax_derivative_fields
+    from gradients.gradient_terms import grad_kl_source
+    from math_utils.push_pull import push_gaussian, GaussianDistribution
+
+    geodesic_force = np.zeros_like(theta)
+    idx_ranges = _compute_parameter_index_ranges(trainer)
+
+    for agent_idx, (mu_start, mu_end, Sigma_start, Sigma_end) in idx_ranges.items():
+        agent = trainer.system.agents[agent_idx]
+        K = agent.config.K
+        kappa_beta = getattr(trainer.system.config, 'kappa_beta', 1.0)
+
+        # Get neighbors
+        neighbors = list(trainer.system.get_neighbors(agent_idx))
+        if len(neighbors) == 0:
+            continue
+
+        # Extract momentum for this agent
+        p_mu = p[mu_start:mu_end].reshape(agent.mu_q.shape)
+
+        # Compute current M and M^{-1}
+        M = _compute_M_for_agent(trainer, agent, agent_idx)
+        M_inv = _invert_mass_matrix(M, K)
+
+        # Compute β fields and their derivatives
+        beta_fields = compute_softmax_weights(
+            trainer.system, agent_idx, 'belief', kappa_beta
+        )
+        softmax_derivs = compute_softmax_derivative_fields(
+            beta_fields, neighbors, kappa_beta
+        )
+
+        # Compute transported distributions and KL gradients
+        kl_grads = {}  # (m, component) -> dKL_im/dμ_i[component]
+        transported_dists = {}
+
+        for m in neighbors:
+            agent_m = trainer.system.agents[m]
+            Omega_im = trainer.system.compute_transport_ij(agent_idx, m)
+
+            # Transport agent m's distribution
+            dist_m = GaussianDistribution(agent_m.mu_q, agent_m.Sigma_q)
+            dist_m_t = push_gaussian(dist_m, Omega_im)
+            transported_dists[m] = dist_m_t
+
+            # dKL_im/dμ_i
+            grad_mu, _ = grad_kl_source(
+                agent.mu_q, agent.Sigma_q,
+                dist_m_t.mu, dist_m_t.Sigma
+            )
+            kl_grads[m] = grad_mu  # Shape: (*S, K)
+
+        # Precompute Ω_ij Σ_qj^{-1} Ω_ij^T for all neighbors
+        coupling_matrices = {}
+        for j in neighbors:
+            agent_j = trainer.system.agents[j]
+            Omega_ij = trainer.system.compute_transport_ij(agent_idx, j)
+            coupling_matrices[j] = _compute_coupling_matrix(
+                agent_j, Omega_ij, K
+            )
+
+        # Compute geodesic force for each μ component
+        for local_idx in range(mu_end - mu_start):
+            global_idx = mu_start + local_idx
+
+            # Map to spatial point and K-component
+            if agent.mu_q.ndim == 1:
+                spatial_idx = None
+                k_idx = local_idx
+            elif agent.mu_q.ndim == 2:
+                spatial_idx = local_idx // K
+                k_idx = local_idx % K
+            else:
+                shape = agent.mu_q.shape
+                flat_spatial = local_idx // K
+                k_idx = local_idx % K
+                spatial_idx = (flat_spatial // shape[1], flat_spatial % shape[1])
+
+            # Compute dM/dμ_i[k] at this spatial point
+            dM_dmu_k = _compute_dM_dmu_analytical(
+                agent, agent_idx, k_idx, spatial_idx,
+                neighbors, beta_fields, softmax_derivs,
+                kl_grads, coupling_matrices, kappa_beta, K
+            )
+
+            # dM^{-1}/dμ_k = -M^{-1} (dM/dμ_k) M^{-1}
+            M_inv_local = _get_spatial_slice(M_inv, spatial_idx)
+            dM_inv_dmu_k = -M_inv_local @ dM_dmu_k @ M_inv_local
+
+            # Geodesic force: -(1/2) π^T (dM^{-1}/dμ_k) π
+            p_local = _get_spatial_slice(p_mu, spatial_idx)
+            geodesic_force[global_idx] = -0.5 * p_local @ dM_inv_dmu_k @ p_local
+
+    return geodesic_force
+
+
+def _compute_M_for_agent(trainer, agent, agent_idx: int) -> np.ndarray:
+    """Compute mass matrix M (not inverted) for an agent."""
+    from gradients.softmax_grads import compute_softmax_weights
+
+    K = agent.config.K
+    kappa_beta = getattr(trainer.system.config, 'kappa_beta', 1.0)
+
+    # Initialize with Σ_p^{-1}
+    if agent.Sigma_p.ndim == 2:
+        M = np.linalg.inv(agent.Sigma_p + 1e-8 * np.eye(K))
+    elif agent.Sigma_p.ndim == 3:
+        M = np.zeros(agent.Sigma_p.shape, dtype=np.float64)
+        for i in range(agent.Sigma_p.shape[0]):
+            M[i] = np.linalg.inv(agent.Sigma_p[i] + 1e-8 * np.eye(K))
+    else:
+        M = np.zeros(agent.Sigma_p.shape, dtype=np.float64)
+        for i in range(agent.Sigma_p.shape[0]):
+            for j in range(agent.Sigma_p.shape[1]):
+                M[i, j] = np.linalg.inv(agent.Sigma_p[i, j] + 1e-8 * np.eye(K))
+
+    # Add relational mass
+    beta_fields = compute_softmax_weights(trainer.system, agent_idx, 'belief', kappa_beta)
+
+    for j_idx, beta_ij in beta_fields.items():
+        agent_j = trainer.system.agents[j_idx]
+        Omega_ij = trainer.system.compute_transport_ij(agent_idx, j_idx)
+
+        if agent.mu_q.ndim == 1:
+            Sigma_q_j_inv = np.linalg.inv(agent_j.Sigma_q + 1e-8 * np.eye(K))
+            M += float(beta_ij) * (Omega_ij @ Sigma_q_j_inv @ Omega_ij.T)
+        elif agent.mu_q.ndim == 2:
+            for i in range(agent.mu_q.shape[0]):
+                Sigma_q_j_inv = np.linalg.inv(agent_j.Sigma_q[i] + 1e-8 * np.eye(K))
+                Omega_c = Omega_ij[i] if Omega_ij.ndim == 3 else Omega_ij
+                M[i] += beta_ij[i] * (Omega_c @ Sigma_q_j_inv @ Omega_c.T)
+        else:
+            for i in range(agent.mu_q.shape[0]):
+                for j in range(agent.mu_q.shape[1]):
+                    Sigma_q_j_inv = np.linalg.inv(agent_j.Sigma_q[i, j] + 1e-8 * np.eye(K))
+                    Omega_c = Omega_ij[i, j] if Omega_ij.ndim == 4 else Omega_ij
+                    M[i, j] += beta_ij[i, j] * (Omega_c @ Sigma_q_j_inv @ Omega_c.T)
+
+    return M
+
+
+def _invert_mass_matrix(M: np.ndarray, K: int) -> np.ndarray:
+    """Invert mass matrix with regularization."""
+    if M.ndim == 2:
+        return np.linalg.inv(M + 1e-8 * np.eye(K))
+    elif M.ndim == 3:
+        M_inv = np.zeros_like(M)
+        for i in range(M.shape[0]):
+            M_inv[i] = np.linalg.inv(M[i] + 1e-8 * np.eye(K))
+        return M_inv
+    else:
+        M_inv = np.zeros_like(M)
+        for i in range(M.shape[0]):
+            for j in range(M.shape[1]):
+                M_inv[i, j] = np.linalg.inv(M[i, j] + 1e-8 * np.eye(K))
+        return M_inv
+
+
+def _compute_coupling_matrix(agent_j, Omega_ij, K: int) -> np.ndarray:
+    """Compute Ω_ij Σ_qj^{-1} Ω_ij^T."""
+    if agent_j.Sigma_q.ndim == 2:
+        Sigma_q_j_inv = np.linalg.inv(agent_j.Sigma_q + 1e-8 * np.eye(K))
+        return Omega_ij @ Sigma_q_j_inv @ Omega_ij.T
+    elif agent_j.Sigma_q.ndim == 3:
+        result = np.zeros((agent_j.Sigma_q.shape[0], K, K))
+        for s in range(agent_j.Sigma_q.shape[0]):
+            Sigma_inv = np.linalg.inv(agent_j.Sigma_q[s] + 1e-8 * np.eye(K))
+            Omega_s = Omega_ij[s] if Omega_ij.ndim == 3 else Omega_ij
+            result[s] = Omega_s @ Sigma_inv @ Omega_s.T
+        return result
+    else:
+        shape = agent_j.Sigma_q.shape[:-2]
+        result = np.zeros((*shape, K, K))
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                Sigma_inv = np.linalg.inv(agent_j.Sigma_q[i, j] + 1e-8 * np.eye(K))
+                Omega_s = Omega_ij[i, j] if Omega_ij.ndim == 4 else Omega_ij
+                result[i, j] = Omega_s @ Sigma_inv @ Omega_s.T
+        return result
+
+
+def _get_spatial_slice(arr: np.ndarray, spatial_idx):
+    """Get slice at spatial index."""
+    if spatial_idx is None:
+        return arr
+    elif isinstance(spatial_idx, int):
+        return arr[spatial_idx]
+    else:
+        return arr[spatial_idx[0], spatial_idx[1]]
+
+
+def _compute_dM_dmu_analytical(
+    agent, agent_idx, k_idx, spatial_idx,
+    neighbors, beta_fields, softmax_derivs,
+    kl_grads, coupling_matrices, kappa_beta, K
+):
+    """
+    Compute dM/dμ_i[k] analytically.
+
+    dM/dμ_i[k] = Σ_j (dβ_ij/dμ_i[k]) · (Ω_ij Σ_qj^{-1} Ω_ij^T)
+
+    where:
+    dβ_ij/dμ_i[k] = Σ_m (dβ_ij/dKL_im) · (dKL_im/dμ_i[k])
+    """
+    dM = np.zeros((K, K), dtype=np.float64)
+
+    for j in neighbors:
+        # Compute dβ_ij/dμ_i[k] = Σ_m (dβ_ij/dKL_im) · (dKL_im/dμ_i[k])
+        dbeta_ij_dmu_k = 0.0
+
+        for m in neighbors:
+            # dβ_ij/dKL_im
+            dbeta_dKL = softmax_derivs.get((j, m))
+            if dbeta_dKL is None:
+                continue
+
+            # Get value at spatial point
+            if spatial_idx is None:
+                dbeta_val = float(dbeta_dKL)
+            elif isinstance(spatial_idx, int):
+                dbeta_val = dbeta_dKL[spatial_idx] if hasattr(dbeta_dKL, '__len__') else float(dbeta_dKL)
+            else:
+                dbeta_val = dbeta_dKL[spatial_idx[0], spatial_idx[1]] if dbeta_dKL.ndim >= 2 else float(dbeta_dKL)
+
+            # dKL_im/dμ_i[k]
+            kl_grad_m = kl_grads[m]
+            if spatial_idx is None:
+                dKL_dmu_k = kl_grad_m[k_idx]
+            elif isinstance(spatial_idx, int):
+                dKL_dmu_k = kl_grad_m[spatial_idx, k_idx]
+            else:
+                dKL_dmu_k = kl_grad_m[spatial_idx[0], spatial_idx[1], k_idx]
+
+            dbeta_ij_dmu_k += dbeta_val * dKL_dmu_k
+
+        # Get coupling matrix at spatial point
+        coupling = coupling_matrices[j]
+        if spatial_idx is None:
+            coupling_local = coupling
+        elif isinstance(spatial_idx, int):
+            coupling_local = coupling[spatial_idx] if coupling.ndim == 3 else coupling
+        else:
+            coupling_local = coupling[spatial_idx[0], spatial_idx[1]] if coupling.ndim == 4 else coupling
+
+        # Accumulate: dM += (dβ_ij/dμ_k) · (Ω_ij Σ_qj^{-1} Ω_ij^T)
+        dM += dbeta_ij_dmu_k * coupling_local
+
+    return dM
+
+
+def compare_geodesic_methods(
+    trainer,
+    theta: np.ndarray,
+    p: np.ndarray,
+    eps: float = 1e-5
+) -> Dict:
+    """
+    Compare finite-difference and analytical geodesic force computations.
+
+    Useful for validation and debugging.
+
+    Args:
+        trainer: HamiltonianTrainer
+        theta: Current parameters
+        p: Current momentum
+        eps: Finite difference step size
+
+    Returns:
+        Dictionary with comparison metrics
+    """
+    # Compute using both methods
+    force_fd = compute_geodesic_force(trainer, theta, p, eps, include_beta_variation=True)
+    force_analytical = compute_geodesic_force_analytical(trainer, theta, p)
+
+    # Compare
+    diff = force_analytical - force_fd
+    relative_diff = np.abs(diff) / (np.abs(force_fd) + 1e-10)
+
+    return {
+        'force_finite_diff': force_fd,
+        'force_analytical': force_analytical,
+        'absolute_diff': diff,
+        'relative_diff': relative_diff,
+        'max_abs_diff': np.max(np.abs(diff)),
+        'max_rel_diff': np.max(relative_diff),
+        'mean_abs_diff': np.mean(np.abs(diff)),
+        'correlation': np.corrcoef(force_fd.flatten(), force_analytical.flatten())[0, 1]
+        if np.std(force_fd) > 1e-10 and np.std(force_analytical) > 1e-10 else 1.0
+    }
 
 
 # =============================================================================

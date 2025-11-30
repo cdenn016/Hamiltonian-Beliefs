@@ -190,7 +190,8 @@ def compute_velocity_full_coupling(
     trainer,
     theta: np.ndarray,
     p: np.ndarray,
-    include_inter_agent: bool = False
+    include_inter_agent: bool = False,
+    coupling_strength: float = 0.1
 ) -> np.ndarray:
     """
     Compute velocity with full mass matrix coupling.
@@ -208,29 +209,89 @@ def compute_velocity_full_coupling(
         theta: Position [mu, Sigma] flattened (interleaved per agent)
         p: Momentum [pi_mu, Pi_Sigma] flattened (interleaved per agent)
         include_inter_agent: If True, use full M^{-1} including off-diagonal
+        coupling_strength: λ for inter-agent coupling (only used if include_inter_agent=True)
 
     Returns:
         dtheta_dt: Velocity vector
 
     Notes:
-        Currently, with include_inter_agent=False, this is equivalent to
-        the existing _compute_velocity_hyperbolic. The full coupling
-        would require defining the physics of inter-agent kinetic coupling.
+        With include_inter_agent=False, this is equivalent to block-diagonal mode.
+        With include_inter_agent=True, the full mass matrix is used:
+            dμ/dt = M^{-1} @ π_μ  (globally coupled)
     """
     dtheta_dt = np.zeros_like(theta)
 
-    # For full coupling, we need to:
-    # 1. Extract all mu momenta (scattered throughout p)
-    # 2. Build full mass matrix
-    # 3. Compute all mu velocities at once
-    # 4. Scatter back to dtheta_dt
-
     if include_inter_agent:
         # Full coupling mode: build global mass matrix and invert
-        raise NotImplementedError(
-            "Full inter-agent coupling not yet implemented. "
-            "Use include_inter_agent=False for block-diagonal mode."
+        # Step 1: Build full mass matrix with inter-agent coupling
+        M_full = build_full_mass_matrix_with_coupling(
+            trainer, theta, coupling_strength, symmetrize=True
         )
+
+        # Step 2: Extract all mu momenta and compute global velocity
+        dim_info = _compute_dimension_info(trainer)
+
+        # Gather all mu momenta into a single vector
+        p_mu_global = np.zeros(dim_info['total_mu_dim'])
+        idx = 0
+        for agent_idx, agent in enumerate(trainer.system.agents):
+            K = agent.config.K
+            n_spatial = agent.mu_q.size // K
+            mu_size = n_spatial * K
+            Sigma_size_per_point = K * (K + 1) // 2
+
+            # Extract mu momentum for this agent from interleaved p
+            p_mu_global[dim_info['mu_ranges'][agent_idx][0]:
+                       dim_info['mu_ranges'][agent_idx][1]] = p[idx:idx + mu_size]
+            idx += mu_size + n_spatial * Sigma_size_per_point
+
+        # Step 3: Solve M @ v = p for v (more stable than explicit inverse)
+        try:
+            M_inv = np.linalg.inv(M_full + 1e-8 * np.eye(len(M_full)))
+            dmu_global = M_inv @ p_mu_global / trainer.mass_scale
+        except np.linalg.LinAlgError:
+            # Fall back to pseudo-inverse if singular
+            dmu_global = np.linalg.lstsq(M_full, p_mu_global, rcond=None)[0] / trainer.mass_scale
+
+        # Step 4: Scatter mu velocities back to dtheta_dt
+        idx = 0
+        for agent_idx, agent in enumerate(trainer.system.agents):
+            K = agent.config.K
+            n_spatial = agent.mu_q.size // K
+            mu_size = n_spatial * K
+            Sigma_size_per_point = K * (K + 1) // 2
+
+            # Place mu velocity
+            mu_start, mu_end = dim_info['mu_ranges'][agent_idx]
+            dtheta_dt[idx:idx + mu_size] = dmu_global[mu_start:mu_end]
+            idx += mu_size
+
+            # Sigma velocity (still uses hyperbolic flow, unchanged)
+            for s in range(n_spatial):
+                Pi_upper = p[idx:idx + Sigma_size_per_point]
+
+                # Reconstruct symmetric matrix
+                Pi_mat = np.zeros((K, K))
+                upper_indices = np.triu_indices(K)
+                Pi_mat[upper_indices] = Pi_upper
+                Pi_mat = Pi_mat + Pi_mat.T - np.diag(np.diag(Pi_mat))
+
+                # Get Sigma for this spatial point
+                if agent.Sigma_q.ndim == 2:
+                    Sigma = agent.Sigma_q
+                elif agent.Sigma_q.ndim == 3:
+                    Sigma = agent.Sigma_q[s]
+                else:
+                    shape = agent.Sigma_q.shape[:-2]
+                    i, j = s // shape[1], s % shape[1]
+                    Sigma = agent.Sigma_q[i, j]
+
+                # Hyperbolic geodesic flow
+                dSigma_dt = Sigma @ Pi_mat @ Sigma / trainer.mass_scale
+                dtheta_dt[idx:idx + Sigma_size_per_point] = dSigma_dt[upper_indices]
+                idx += Sigma_size_per_point
+
+        return dtheta_dt
 
     # Block-diagonal mode: same as _compute_velocity_hyperbolic
     # Process each agent separately
@@ -503,35 +564,53 @@ def _project_to_upper_triangle(M_full: np.ndarray, K: int) -> np.ndarray:
 
 
 # =============================================================================
-# Inter-Agent Coupling (Future Extension)
+# Inter-Agent Coupling
 # =============================================================================
 
 def compute_inter_agent_coupling_block(
     trainer,
     agent_i_idx: int,
-    agent_k_idx: int
+    agent_k_idx: int,
+    coupling_strength: float = 0.1
 ) -> np.ndarray:
     """
-    Compute M_{ik}^{mu mu} for inter-agent coupling.
+    Compute M_{ik}^{mu mu} for inter-agent kinetic coupling.
 
-    PLACEHOLDER: Currently returns zero matrix.
+    Physical Interpretation:
+    ------------------------
+    The inter-agent coupling creates momentum exchange between aligned agents.
+    When agents i and k are in consensus (high β_ik), their momenta become
+    coupled - a push on agent i partially accelerates agent k.
 
-    In a more sophisticated model, inter-agent kinetic coupling could arise from:
-    1. Shared latent variables
-    2. Coupled observation models
-    3. Hierarchical prior structure
+    Mathematical Form:
+    ------------------
+    M_ik^{μμ} = -λ * β_ik * Ω_ik * Σ_pk^{-1} * Ω_ik^T
 
-    For the current consensus coupling model, there's no kinetic coupling
-    between agents - all coupling is in the potential (free energy).
+    where:
+    - λ is the coupling strength (small to maintain positive definiteness)
+    - β_ik is the softmax coupling weight (high when agents agree)
+    - Ω_ik is the transport operator from k to i's frame
+    - Σ_pk^{-1} is agent k's prior precision (their "inertia")
+
+    The negative sign ensures the full mass matrix M remains SPD when λ < 1.
+    This creates attractive coupling: aligned agents share kinetic energy.
 
     Args:
         trainer: HamiltonianTrainer
         agent_i_idx: First agent index
         agent_k_idx: Second agent index
+        coupling_strength: λ parameter (default 0.1, must be < 1 for SPD)
 
     Returns:
-        M_ik: Inter-agent coupling block (currently zeros)
+        M_ik: Inter-agent coupling block, shape (dim_i, dim_k)
+
+    Notes:
+        - M_ik ≠ M_ki in general (asymmetric coupling)
+        - For symmetric M, use (M_ik + M_ki.T) / 2 in full matrix
+        - Coupling vanishes when β_ik → 0 (no consensus)
     """
+    from gradients.softmax_grads import compute_softmax_weights
+
     if agent_i_idx == agent_k_idx:
         raise ValueError("Use _compute_mu_block for diagonal blocks")
 
@@ -544,8 +623,129 @@ def compute_inter_agent_coupling_block(
     if K_i != K_k:
         raise ValueError("Inter-agent coupling requires same latent dimension")
 
-    dim_i = agent_i.mu_q.size
-    dim_k = agent_k.mu_q.size
+    K = K_i  # Same for both
 
-    # Currently: no kinetic coupling
-    return np.zeros((dim_i, dim_k), dtype=np.float64)
+    # Get softmax coupling weight β_ik
+    kappa_beta = getattr(trainer.system.config, 'kappa_beta', 1.0)
+    beta_fields = compute_softmax_weights(trainer.system, agent_i_idx, 'belief', kappa_beta)
+
+    # Check if k is a neighbor of i
+    if agent_k_idx not in beta_fields:
+        # No coupling if not neighbors
+        dim_i = agent_i.mu_q.size
+        dim_k = agent_k.mu_q.size
+        return np.zeros((dim_i, dim_k), dtype=np.float64)
+
+    beta_ik = beta_fields[agent_k_idx]
+
+    # Get transport operator
+    Omega_ik = trainer.system.compute_transport_ij(agent_i_idx, agent_k_idx)
+
+    # Compute coupling block based on spatial structure
+    if agent_i.mu_q.ndim == 1:
+        # 0D: single K x K block
+        Sigma_pk_inv = np.linalg.inv(agent_k.Sigma_p + 1e-8 * np.eye(K))
+        M_ik = -coupling_strength * float(beta_ik) * (Omega_ik @ Sigma_pk_inv @ Omega_ik.T)
+        return M_ik
+
+    elif agent_i.mu_q.ndim == 2:
+        # 1D field: block diagonal coupling
+        n_spatial = agent_i.mu_q.shape[0]
+        dim_i = agent_i.mu_q.size
+        dim_k = agent_k.mu_q.size
+
+        M_ik = np.zeros((dim_i, dim_k), dtype=np.float64)
+
+        for s in range(n_spatial):
+            Sigma_pk_inv = np.linalg.inv(agent_k.Sigma_p[s] + 1e-8 * np.eye(K))
+            Omega_s = Omega_ik[s] if Omega_ik.ndim == 3 else Omega_ik
+            beta_s = beta_ik[s] if hasattr(beta_ik, '__len__') else float(beta_ik)
+
+            block = -coupling_strength * beta_s * (Omega_s @ Sigma_pk_inv @ Omega_s.T)
+
+            # Place in block-diagonal position
+            i_start, i_end = s * K, (s + 1) * K
+            k_start, k_end = s * K, (s + 1) * K
+            M_ik[i_start:i_end, k_start:k_end] = block
+
+        return M_ik
+
+    else:
+        # 2D field
+        shape = agent_i.mu_q.shape[:-1]
+        n_spatial = shape[0] * shape[1]
+        dim_i = agent_i.mu_q.size
+        dim_k = agent_k.mu_q.size
+
+        M_ik = np.zeros((dim_i, dim_k), dtype=np.float64)
+
+        for s in range(n_spatial):
+            x, y = s // shape[1], s % shape[1]
+            Sigma_pk_inv = np.linalg.inv(agent_k.Sigma_p[x, y] + 1e-8 * np.eye(K))
+            Omega_s = Omega_ik[x, y] if Omega_ik.ndim == 4 else Omega_ik
+            beta_s = beta_ik[x, y] if beta_ik.ndim >= 2 else float(beta_ik)
+
+            block = -coupling_strength * beta_s * (Omega_s @ Sigma_pk_inv @ Omega_s.T)
+
+            i_start, i_end = s * K, (s + 1) * K
+            k_start, k_end = s * K, (s + 1) * K
+            M_ik[i_start:i_end, k_start:k_end] = block
+
+        return M_ik
+
+
+def build_full_mass_matrix_with_coupling(
+    trainer,
+    theta: np.ndarray,
+    coupling_strength: float = 0.1,
+    symmetrize: bool = True
+) -> np.ndarray:
+    """
+    Build full mass matrix including inter-agent kinetic coupling.
+
+    This constructs M with both diagonal (M_ii) and off-diagonal (M_ik) blocks.
+
+    Args:
+        trainer: HamiltonianTrainer
+        theta: Current parameters
+        coupling_strength: λ for inter-agent coupling (0 = no coupling)
+        symmetrize: If True, symmetrize off-diagonal blocks
+
+    Returns:
+        M: Full mass matrix with inter-agent coupling
+    """
+    from gradients.softmax_grads import compute_softmax_weights
+
+    system = trainer.system
+    n_agents = system.n_agents
+
+    # Compute dimensions
+    dim_info = _compute_dimension_info(trainer)
+    total_mu_dim = dim_info['total_mu_dim']
+
+    # Initialize with diagonal blocks
+    M = build_mu_mass_matrix(trainer, theta, include_off_diagonal=False)
+
+    # Add off-diagonal blocks
+    if coupling_strength > 0:
+        for i in range(n_agents):
+            for k in range(n_agents):
+                if i == k:
+                    continue
+
+                M_ik = compute_inter_agent_coupling_block(
+                    trainer, i, k, coupling_strength
+                )
+
+                # Get index ranges
+                i_start, i_end = dim_info['mu_ranges'][i]
+                k_start, k_end = dim_info['mu_ranges'][k]
+
+                # Place block
+                M[i_start:i_end, k_start:k_end] = M_ik
+
+        # Symmetrize if requested (for SPD guarantee)
+        if symmetrize:
+            M = (M + M.T) / 2
+
+    return M
