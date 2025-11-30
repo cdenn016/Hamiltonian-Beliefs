@@ -44,6 +44,7 @@ from gradients.free_energy_clean import compute_total_free_energy, FreeEnergyBre
 from config import TrainingConfig
 from data_utils.mu_tracking import create_mu_tracker, MuCenterTracking
 from geometry.phase_space_tracker import PhaseSpaceTracker
+from geometry.geodesic_corrections import compute_geodesic_force, diagnose_geodesic_correction
 
 
 @dataclass
@@ -192,7 +193,9 @@ class HamiltonianTrainer:
                  friction: float = 0.0,
                  mass_scale: float = 1.0,
                  track_phase_space: bool = True,
-                 phase_space_output_dir: Optional[Path] = None):
+                 phase_space_output_dir: Optional[Path] = None,
+                 enable_geodesic_correction: bool = True,
+                 geodesic_eps: float = 1e-5):
         """
         Initialize Hamiltonian trainer.
 
@@ -207,11 +210,19 @@ class HamiltonianTrainer:
             mass_scale: Overall mass scale (affects oscillation frequency)
             track_phase_space: Whether to enable PhaseSpaceTracker for orbit visualization
             phase_space_output_dir: Directory for phase space plots (default: ./phase_space_output)
+            enable_geodesic_correction: Whether to include geodesic forces from dM/dθ
+                                        True: Full Hamiltonian with curvature (geodesics)
+                                        False: Ignore curvature (faster but less accurate)
+            geodesic_eps: Finite difference step for geodesic force computation
         """
         self.system = system
         self.config = config or TrainingConfig()
         self.friction = friction
         self.mass_scale = mass_scale
+
+        # Geodesic correction settings
+        self.enable_geodesic_correction = enable_geodesic_correction
+        self.geodesic_eps = geodesic_eps
 
         # Training state
         self.history = HamiltonianHistory()
@@ -240,10 +251,11 @@ class HamiltonianTrainer:
         # Track performance
         self._step_times = []
 
-        print(f"✓ Hamiltonian trainer initialized")
-        print(f"  Friction: γ = {friction}")
+        print(f"Hamiltonian trainer initialized")
+        print(f"  Friction: gamma = {friction}")
         print(f"  Mass scale: {mass_scale}")
         print(f"  Regime: {'Conservative' if friction < 0.01 else 'Damped'}")
+        print(f"  Geodesic correction: {'ENABLED' if enable_geodesic_correction else 'DISABLED'}")
         if track_phase_space:
             print(f"  Phase space tracking: ENABLED")
 
@@ -652,35 +664,49 @@ class HamiltonianTrainer:
 
     def _hamiltonian_equations(self, theta: np.ndarray, p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute COMPLETE Hamilton's equations on product manifold ℝ^K × SPD(n).
+        Compute COMPLETE Hamilton's equations on product manifold R^K x SPD(n).
 
-        CRITICAL: For Σ parameters, uses geodesic flow on SPD(n):
-            dΣ/dt = Σ Π Σ  (affine-invariant metric, κ = -1/4)
-            dΠ/dt = -∂V/∂Σ
+        CRITICAL: For Sigma parameters, uses geodesic flow on SPD(n):
+            dSigma/dt = Sigma Pi Sigma  (affine-invariant metric, kappa = -1/4)
+            dPi/dt = -dV/dSigma
 
-        For μ parameters (COMPLETE Fisher-Rao with coupling):
-            dμ/dt = M^{-1} π_μ  where M = Σ_p^{-1} + Σ_j β_ij Ω_ij Σ_q_j^{-1} Ω_ij^T
-            dπ/dt = -∂V/∂μ
+        For mu parameters (COMPLETE Fisher-Rao with coupling):
+            dmu/dt = M^{-1} pi_mu  where M = Sigma_p^{-1} + sum_j beta_ij Omega_ij Sigma_qj^{-1} Omega_ij^T
+            dpi/dt = -dV/dmu - (1/2) pi^T (dM^{-1}/dmu) pi  [GEODESIC CORRECTION!]
 
-        Mass includes bare (Σ_p^{-1}) + relational (Σ_j β_ij...) components.
+        The geodesic correction term ensures trajectories follow geodesics on the
+        statistical manifold defined by the position-dependent Fisher-Rao metric.
+
+        Mass includes bare (Sigma_p^{-1}) + relational (sum_j beta_ij...) components.
         This provides natural damping through consensus coupling!
 
-        If friction > 0, adds damping: dp/dt -= γ*p
+        If friction > 0, adds damping: dp/dt -= gamma*p
 
         Args:
-            theta: Position [μ, Σ] (flattened)
-            p: Momentum [π_μ, Π_Σ] (flattened)
+            theta: Position [mu, Sigma] (flattened)
+            p: Momentum [pi_mu, Pi_Sigma] (flattened)
 
         Returns:
-            dtheta_dt: Velocity with COMPLETE Fisher-Rao (μ) + hyperbolic geodesic (Σ)
-            dp_dt: Force -∇V with optional friction
+            dtheta_dt: Velocity with COMPLETE Fisher-Rao (mu) + hyperbolic geodesic (Sigma)
+            dp_dt: Force -dV + geodesic correction + optional friction
         """
-        # Compute velocity using hyperbolic geometry for Σ part
+        # Compute velocity using hyperbolic geometry for Sigma part
         dtheta_dt = self._compute_velocity_hyperbolic(theta, p)
 
-        # dp/dt = -∇V (ignoring curvature correction for now)
+        # dp/dt = -dV/dtheta (potential force)
         force = self._compute_force(theta)
         dp_dt = force
+
+        # Add geodesic correction: -(1/2) p^T (dM^{-1}/dtheta) p
+        # This term arises from the position-dependent mass matrix M(theta)
+        # and ensures trajectories follow geodesics on the statistical manifold
+        if self.enable_geodesic_correction:
+            geodesic_force = compute_geodesic_force(
+                self, theta, p,
+                eps=self.geodesic_eps,
+                include_beta_variation=True
+            )
+            dp_dt += geodesic_force
 
         # Add friction if specified
         if self.friction > 0:
@@ -949,3 +975,123 @@ class HamiltonianTrainer:
             path = self.phase_space_output_dir / "tracker.pkl"
 
         self.phase_space_tracker.save(path)
+
+    def diagnose_geodesic_correction(self) -> dict:
+        """
+        Diagnose the geodesic correction at current state.
+
+        Returns detailed analysis of the geodesic correction term relative
+        to the potential force term. This is useful for understanding whether
+        the geodesic correction is significant for your system.
+
+        Returns:
+            Dictionary with diagnostic information:
+            - geodesic_force_norm: ||F_geo||
+            - potential_force_norm: ||-dV/dtheta||
+            - ratio: How significant is geodesic vs potential force
+            - agent_contributions: Per-agent breakdown
+        """
+        return diagnose_geodesic_correction(
+            self, self.theta, self.p, eps=self.geodesic_eps
+        )
+
+    def compare_energy_conservation(self, n_steps: int = 100, dt: float = 0.01) -> dict:
+        """
+        Compare energy conservation with and without geodesic correction.
+
+        Runs two short simulations from the same initial state:
+        1. With geodesic correction enabled
+        2. Without geodesic correction
+
+        Returns comparison statistics for energy drift.
+
+        Args:
+            n_steps: Number of steps to run
+            dt: Time step
+
+        Returns:
+            Dictionary with comparison results:
+            - with_geo_drift: Energy drift with geodesic correction
+            - without_geo_drift: Energy drift without geodesic correction
+            - improvement_factor: How much better is with vs without
+        """
+        # Save current state
+        theta_backup = self.theta.copy()
+        p_backup = self.p.copy()
+        geo_setting_backup = self.enable_geodesic_correction
+
+        # Initial energy
+        energies = compute_total_free_energy(self.system)
+        G = self._compute_metric(self.theta)
+        G_inv = np.linalg.inv(G + 1e-6 * np.eye(len(G)))
+        T0 = 0.5 * self.p @ G_inv @ self.p
+        V0 = energies.total
+        H0 = T0 + V0
+
+        results = {}
+
+        # Run WITH geodesic correction
+        self.enable_geodesic_correction = True
+        self.theta = theta_backup.copy()
+        self.p = p_backup.copy()
+        self._unpack_parameters(self.theta)
+
+        H_with = [H0]
+        for _ in range(n_steps):
+            dtheta_dt, dp_dt = self._hamiltonian_equations(self.theta, self.p)
+            self.p = self.p + 0.5 * dt * dp_dt
+            dtheta_dt, _ = self._hamiltonian_equations(self.theta, self.p)
+            self.theta = self.theta + dt * dtheta_dt
+            self._unpack_parameters(self.theta)
+            _, dp_dt = self._hamiltonian_equations(self.theta, self.p)
+            self.p = self.p + 0.5 * dt * dp_dt
+
+            # Compute H
+            energies = compute_total_free_energy(self.system)
+            G = self._compute_metric(self.theta)
+            G_inv = np.linalg.inv(G + 1e-6 * np.eye(len(G)))
+            T = 0.5 * self.p @ G_inv @ self.p
+            H_with.append(T + energies.total)
+
+        with_geo_drift = [abs(H - H0) / (abs(H0) + 1e-10) for H in H_with]
+        results['with_geo_drift'] = with_geo_drift[-1]
+        results['with_geo_history'] = with_geo_drift
+
+        # Run WITHOUT geodesic correction
+        self.enable_geodesic_correction = False
+        self.theta = theta_backup.copy()
+        self.p = p_backup.copy()
+        self._unpack_parameters(self.theta)
+
+        H_without = [H0]
+        for _ in range(n_steps):
+            dtheta_dt, dp_dt = self._hamiltonian_equations(self.theta, self.p)
+            self.p = self.p + 0.5 * dt * dp_dt
+            dtheta_dt, _ = self._hamiltonian_equations(self.theta, self.p)
+            self.theta = self.theta + dt * dtheta_dt
+            self._unpack_parameters(self.theta)
+            _, dp_dt = self._hamiltonian_equations(self.theta, self.p)
+            self.p = self.p + 0.5 * dt * dp_dt
+
+            # Compute H
+            energies = compute_total_free_energy(self.system)
+            G = self._compute_metric(self.theta)
+            G_inv = np.linalg.inv(G + 1e-6 * np.eye(len(G)))
+            T = 0.5 * self.p @ G_inv @ self.p
+            H_without.append(T + energies.total)
+
+        without_geo_drift = [abs(H - H0) / (abs(H0) + 1e-10) for H in H_without]
+        results['without_geo_drift'] = without_geo_drift[-1]
+        results['without_geo_history'] = without_geo_drift
+
+        # Compute improvement factor
+        improvement = results['without_geo_drift'] / (results['with_geo_drift'] + 1e-10)
+        results['improvement_factor'] = improvement
+
+        # Restore original state
+        self.theta = theta_backup
+        self.p = p_backup
+        self._unpack_parameters(self.theta)
+        self.enable_geodesic_correction = geo_setting_backup
+
+        return results
