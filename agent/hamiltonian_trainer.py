@@ -45,6 +45,12 @@ from config import TrainingConfig
 from data_utils.mu_tracking import create_mu_tracker, MuCenterTracking
 from geometry.phase_space_tracker import PhaseSpaceTracker
 from geometry.geodesic_corrections import compute_geodesic_force, diagnose_geodesic_correction
+from geometry.multi_agent_mass_matrix import (
+    build_full_mass_matrix,
+    build_mu_mass_matrix,
+    diagnose_mass_matrix,
+    compute_velocity_full_coupling
+)
 
 
 @dataclass
@@ -994,6 +1000,34 @@ class HamiltonianTrainer:
         return diagnose_geodesic_correction(
             self, self.theta, self.p, eps=self.geodesic_eps
         )
+
+    def diagnose_mass_matrix(self) -> dict:
+        """
+        Diagnose the mass matrix structure at current state.
+
+        Returns information about conditioning, eigenvalues, and structure
+        of the mass matrix. Useful for understanding numerical stability
+        and the relative importance of coupling terms.
+
+        Returns:
+            Dictionary with:
+            - total_dim: Total dimension of mu coordinates
+            - n_agents: Number of agents
+            - per_agent_dims: Dimension per agent
+            - condition_numbers: Per-agent and global condition numbers
+            - diagonal_dominance: How block-diagonal is the matrix
+            - min_eigenvalue: Smallest eigenvalue (stability)
+        """
+        diag = diagnose_mass_matrix(self, self.theta)
+        return {
+            'total_dim': diag.total_dim,
+            'n_agents': diag.n_agents,
+            'per_agent_dims': diag.per_agent_dims,
+            'condition_numbers': diag.condition_numbers,
+            'global_condition_number': diag.global_condition_number,
+            'diagonal_dominance': diag.diagonal_dominance,
+            'min_eigenvalue': diag.min_eigenvalue
+        }
 
     def compare_energy_conservation(self, n_steps: int = 100, dt: float = 0.01) -> dict:
         """
