@@ -34,6 +34,12 @@ from geometry.geodesic_corrections import (
     _compute_parameter_index_ranges,
     _compute_M_inverse_for_agent
 )
+from geometry.multi_agent_mass_matrix import (
+    build_full_mass_matrix,
+    build_mu_mass_matrix,
+    diagnose_mass_matrix,
+    compute_velocity_full_coupling
+)
 
 
 def create_test_system(n_agents: int = 3, K: int = 3, seed: int = 42):
@@ -329,6 +335,114 @@ def test_parameter_index_ranges():
     print()
 
 
+def test_mass_matrix_structure():
+    """Test the multi-agent mass matrix structure."""
+    print("=" * 60)
+    print("TEST 7: Mass Matrix Structure")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=3, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    # Build the mass matrix
+    M_mu = build_mu_mass_matrix(trainer, trainer.theta)
+
+    print(f"Mass matrix shape: {M_mu.shape}")
+    print(f"Mass matrix is symmetric: {np.allclose(M_mu, M_mu.T)}")
+
+    # Check positive definiteness
+    eigenvalues = np.linalg.eigvalsh(M_mu)
+    print(f"Min eigenvalue: {eigenvalues.min():.6f}")
+    print(f"Max eigenvalue: {eigenvalues.max():.6f}")
+    print(f"Condition number: {eigenvalues.max() / (eigenvalues.min() + 1e-10):.2f}")
+
+    assert M_mu.shape[0] == M_mu.shape[1], "Mass matrix not square!"
+    assert np.allclose(M_mu, M_mu.T), "Mass matrix not symmetric!"
+    assert eigenvalues.min() > 0, "Mass matrix not positive definite!"
+
+    print("\nPASSED: Mass matrix structure is correct.")
+    print()
+
+
+def test_mass_matrix_diagnostics():
+    """Test mass matrix diagnostic function."""
+    print("=" * 60)
+    print("TEST 8: Mass Matrix Diagnostics")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=3, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    diag = trainer.diagnose_mass_matrix()
+
+    print(f"Total dimension: {diag['total_dim']}")
+    print(f"Number of agents: {diag['n_agents']}")
+    print(f"Global condition number: {diag['global_condition_number']:.2f}")
+    print(f"Diagonal dominance: {diag['diagonal_dominance']:.2f}")
+    print(f"Min eigenvalue: {diag['min_eigenvalue']:.6f}")
+    print()
+    print("Per-agent condition numbers:")
+    for agent_idx, cond in diag['condition_numbers'].items():
+        print(f"  Agent {agent_idx}: {cond:.2f}")
+
+    assert diag['n_agents'] == 3
+    assert diag['min_eigenvalue'] > 0
+
+    print("\nPASSED: Mass matrix diagnostics work correctly.")
+    print()
+
+
+def test_velocity_full_coupling():
+    """Test velocity computation with full mass matrix."""
+    print("=" * 60)
+    print("TEST 9: Full Coupling Velocity Computation")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=2, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=False,
+        track_phase_space=False
+    )
+
+    np.random.seed(42)
+    trainer.p = 0.2 * np.random.randn(len(trainer.theta))
+
+    # Compute velocity using current per-agent method
+    v_current = trainer._compute_velocity_hyperbolic(trainer.theta, trainer.p)
+
+    # Compute velocity using full mass matrix (diagonal only, should match)
+    v_full = compute_velocity_full_coupling(
+        trainer, trainer.theta, trainer.p,
+        include_inter_agent=False
+    )
+
+    diff = np.linalg.norm(v_current - v_full)
+    print(f"||v_current||: {np.linalg.norm(v_current):.6f}")
+    print(f"||v_full||: {np.linalg.norm(v_full):.6f}")
+    print(f"Difference: {diff:.6e}")
+
+    # Should be very close (numerical precision)
+    assert diff < 1e-6, f"Velocity mismatch! diff = {diff}"
+
+    print("\nPASSED: Full coupling velocity matches per-agent computation.")
+    print()
+
+
 def run_all_tests():
     """Run all tests."""
     print("\n" + "=" * 60)
@@ -342,6 +456,9 @@ def run_all_tests():
         test_parameter_index_ranges,
         test_hamiltonian_equations_integration,
         test_energy_conservation_comparison,
+        test_mass_matrix_structure,
+        test_mass_matrix_diagnostics,
+        test_velocity_full_coupling,
     ]
 
     passed = 0
