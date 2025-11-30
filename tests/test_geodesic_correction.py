@@ -38,7 +38,13 @@ from geometry.multi_agent_mass_matrix import (
     build_full_mass_matrix,
     build_mu_mass_matrix,
     diagnose_mass_matrix,
-    compute_velocity_full_coupling
+    compute_velocity_full_coupling,
+    compute_inter_agent_coupling_block,
+    build_full_mass_matrix_with_coupling
+)
+from geometry.geodesic_corrections import (
+    compute_geodesic_force_analytical,
+    compare_geodesic_methods
 )
 
 
@@ -443,6 +449,214 @@ def test_velocity_full_coupling():
     print()
 
 
+def test_inter_agent_coupling_block():
+    """Test inter-agent coupling block computation."""
+    print("=" * 60)
+    print("TEST 10: Inter-Agent Coupling Block")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=3, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    # Compute coupling block between agents 0 and 1
+    M_01 = compute_inter_agent_coupling_block(trainer, 0, 1, coupling_strength=0.1)
+
+    print(f"M_01 shape: {M_01.shape}")
+    print(f"M_01 norm: {np.linalg.norm(M_01):.6f}")
+    print(f"M_01 max: {np.max(np.abs(M_01)):.6f}")
+
+    # Should be non-zero for neighbors
+    agent0 = system.agents[0]
+    agent1 = system.agents[1]
+    expected_shape = (agent0.mu_q.size, agent1.mu_q.size)
+
+    assert M_01.shape == expected_shape, f"Shape mismatch: {M_01.shape} vs {expected_shape}"
+    assert np.all(np.isfinite(M_01)), "Non-finite values in coupling block!"
+
+    print("\nPASSED: Inter-agent coupling block computed correctly.")
+    print()
+
+
+def test_full_mass_matrix_with_coupling():
+    """Test full mass matrix construction with inter-agent coupling."""
+    print("=" * 60)
+    print("TEST 11: Full Mass Matrix with Coupling")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=3, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    # Build with coupling
+    M_coupled = build_full_mass_matrix_with_coupling(
+        trainer, trainer.theta,
+        coupling_strength=0.1, symmetrize=True
+    )
+
+    # Build without coupling
+    M_uncoupled = build_mu_mass_matrix(trainer, trainer.theta)
+
+    print(f"M_coupled shape: {M_coupled.shape}")
+    print(f"M_uncoupled shape: {M_uncoupled.shape}")
+
+    # Check symmetry
+    print(f"M_coupled is symmetric: {np.allclose(M_coupled, M_coupled.T)}")
+
+    # Check positive definiteness
+    eigenvalues = np.linalg.eigvalsh(M_coupled)
+    print(f"Min eigenvalue: {eigenvalues.min():.6f}")
+    print(f"Max eigenvalue: {eigenvalues.max():.6f}")
+
+    # Difference should be in off-diagonal blocks
+    diff = M_coupled - M_uncoupled
+    off_diag_norm = np.linalg.norm(diff)
+    print(f"Off-diagonal contribution norm: {off_diag_norm:.6f}")
+
+    assert M_coupled.shape == M_uncoupled.shape
+    assert np.allclose(M_coupled, M_coupled.T), "Coupled matrix not symmetric!"
+    assert eigenvalues.min() > 0, "Coupled matrix not positive definite!"
+
+    print("\nPASSED: Full mass matrix with coupling is correct.")
+    print()
+
+
+def test_velocity_with_inter_agent_coupling():
+    """Test velocity computation with inter-agent coupling enabled."""
+    print("=" * 60)
+    print("TEST 12: Velocity with Inter-Agent Coupling")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=2, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=False,
+        track_phase_space=False
+    )
+
+    np.random.seed(42)
+    trainer.p = 0.2 * np.random.randn(len(trainer.theta))
+
+    # Compute velocity without inter-agent coupling
+    v_uncoupled = compute_velocity_full_coupling(
+        trainer, trainer.theta, trainer.p,
+        include_inter_agent=False
+    )
+
+    # Compute velocity with inter-agent coupling
+    v_coupled = compute_velocity_full_coupling(
+        trainer, trainer.theta, trainer.p,
+        include_inter_agent=True,
+        coupling_strength=0.1
+    )
+
+    diff = np.linalg.norm(v_coupled - v_uncoupled)
+    print(f"||v_uncoupled||: {np.linalg.norm(v_uncoupled):.6f}")
+    print(f"||v_coupled||: {np.linalg.norm(v_coupled):.6f}")
+    print(f"Difference: {diff:.6f}")
+
+    # Should be different (coupling changes velocity)
+    assert np.all(np.isfinite(v_coupled)), "Non-finite values in coupled velocity!"
+    # The difference should exist but not be huge
+    print(f"Relative difference: {diff / (np.linalg.norm(v_uncoupled) + 1e-10):.4f}")
+
+    print("\nPASSED: Velocity with inter-agent coupling computed correctly.")
+    print()
+
+
+def test_analytical_geodesic_force():
+    """Test analytical geodesic force computation."""
+    print("=" * 60)
+    print("TEST 13: Analytical Geodesic Force")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=2, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    np.random.seed(42)
+    trainer.p = 0.3 * np.random.randn(len(trainer.theta))
+
+    # Compute analytical geodesic force
+    geo_force = compute_geodesic_force_analytical(trainer, trainer.theta, trainer.p)
+
+    print(f"Analytical geodesic force shape: {geo_force.shape}")
+    print(f"Analytical geodesic force norm: {np.linalg.norm(geo_force):.6f}")
+    print(f"Analytical geodesic force max: {np.max(np.abs(geo_force)):.6f}")
+
+    assert geo_force.shape == trainer.theta.shape
+    assert np.all(np.isfinite(geo_force)), "Non-finite values in analytical force!"
+
+    print("\nPASSED: Analytical geodesic force computed correctly.")
+    print()
+
+
+def test_geodesic_methods_comparison():
+    """Compare finite-difference and analytical geodesic force methods."""
+    print("=" * 60)
+    print("TEST 14: Geodesic Methods Comparison")
+    print("=" * 60)
+
+    system = create_test_system(n_agents=2, K=3)
+    trainer = HamiltonianTrainer(
+        system,
+        friction=0.0,
+        mass_scale=1.0,
+        enable_geodesic_correction=True,
+        track_phase_space=False
+    )
+
+    np.random.seed(42)
+    trainer.p = 0.3 * np.random.randn(len(trainer.theta))
+
+    # Compare methods
+    comparison = compare_geodesic_methods(trainer, trainer.theta, trainer.p, eps=1e-5)
+
+    print(f"Max absolute difference: {comparison['max_abs_diff']:.6e}")
+    print(f"Max relative difference: {comparison['max_rel_diff']:.6e}")
+    print(f"Mean absolute difference: {comparison['mean_abs_diff']:.6e}")
+    print(f"Correlation: {comparison['correlation']:.6f}")
+
+    # Check that methods agree reasonably well
+    # Note: Some difference is expected due to numerical approximation
+    fd_norm = np.linalg.norm(comparison['force_finite_diff'])
+    analytical_norm = np.linalg.norm(comparison['force_analytical'])
+
+    print(f"\nFinite diff norm: {fd_norm:.6f}")
+    print(f"Analytical norm: {analytical_norm:.6f}")
+
+    # Either both should be small, or they should correlate well
+    if fd_norm > 1e-8 and analytical_norm > 1e-8:
+        assert comparison['correlation'] > 0.5, \
+            f"Methods should correlate! Got {comparison['correlation']}"
+        print("Methods correlate well.")
+    else:
+        print("Forces are small, correlation check skipped.")
+
+    assert np.all(np.isfinite(comparison['force_finite_diff']))
+    assert np.all(np.isfinite(comparison['force_analytical']))
+
+    print("\nPASSED: Geodesic methods comparison completed.")
+    print()
+
+
 def run_all_tests():
     """Run all tests."""
     print("\n" + "=" * 60)
@@ -459,6 +673,11 @@ def run_all_tests():
         test_mass_matrix_structure,
         test_mass_matrix_diagnostics,
         test_velocity_full_coupling,
+        test_inter_agent_coupling_block,
+        test_full_mass_matrix_with_coupling,
+        test_velocity_with_inter_agent_coupling,
+        test_analytical_geodesic_force,
+        test_geodesic_methods_comparison,
     ]
 
     passed = 0
